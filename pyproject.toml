@@ -17,16 +17,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "numpy",
-    "matplotlib",
-    "astropy",
-    "scipy",
-    "pandas",
     "tqdm",
-    "requests",
     "pytest",
-    "mygw @ https://github.com/tomas-cabrera/mygw.git",
-    "myagn @ https://github.com/tomas-cabrera/myagn.git",
+    "mygw @ git+https://github.com/tomas-cabrera/mygw",
+    "myagn @ git+https://github.com/tomas-cabrera/myagn",
 ]
 
 [project.urls]
