@@ -1,0 +1,14 @@
+# __pycache__
+**/__pycache__/
+
+# caches
+**/.cache/
+
+# egg-info
+**/*.egg-info/
+
+# distribution
+/dist/
+
+# test plots
+tests/figures/*
