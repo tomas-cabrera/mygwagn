@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
     "tqdm",
     "pytest",
+    "emcee",
     "mygw @ git+https://github.com/tomas-cabrera/mygw",
     "myagn @ git+https://github.com/tomas-cabrera/myagn",
 ]
