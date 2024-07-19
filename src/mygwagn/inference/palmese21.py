@@ -9,11 +9,10 @@ import ligo.skymap.moc as lsm_moc
 import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.cosmology import FlatLambdaCDM
-from astropy.time import Time
 from astropy.table import QTable
+from astropy.time import Time
 from ligo.skymap.io.fits import write_sky_map
 from myagn.flares.flares import Flare
-from mygw.io.healvox import HEALVox
 from mygw.io.skymaps import Skymap
 
 from mygwagn.io import paths
