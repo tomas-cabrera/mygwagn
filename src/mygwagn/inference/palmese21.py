@@ -28,16 +28,12 @@ def _calc_active_skymap(active_skymaps):
     hpx_arr = np.array([asm["INCIFOLLOWUP"] for asm in active_skymaps])
 
     # Highlight all active hpxs
-    hpxs = np.any(hpxs, axis=0)
+    hpxs = np.any(hpx_arr, axis=0)
 
     ### ZMIN, ZMAX
     # Get zmins, zmaxs
     zmin_arr = np.array([asm["ZMIN"] for asm in active_skymaps])
     zmax_arr = np.array([asm["ZMAX"] for asm in active_skymaps])
-
-    # Set inactive zmins, zmaxs to np.nan
-    zmin_arr[~hpxs] = np.nan
-    zmax_arr[~hpxs] = np.nan
 
     # Get min, max zmins, zmaxs
     zmin = np.nanmin(zmin_arr, axis=0)
@@ -61,7 +57,7 @@ def mock_data(
     lambda_,
     agn_distribution,
     flare_model,
-    n_gw=100,
+    n_gw=50,
     ci_followup=0.9,
     Dt_followup=200 * u.day,
     background_skymap_level=5,
@@ -78,13 +74,13 @@ def mock_data(
     ##############################
 
     # Get skymap filenames
-    skymap_filenames = glob.glob(pa.join(skymap_dir, "*.fits"))
+    skymap_filenames = glob.glob(pa.join(skymap_dir, "*IMRPhenomXPHM.fits"))
 
     # Choose n_gw skymaps
     skymap_filenames = rng_np.choice(skymap_filenames, n_gw, replace=False)
 
     # Initialize skymaps
-    gw_skymaps = [Skymap(f) for f in skymap_filenames]
+    gw_skymaps = [Skymap(f, moc=True) for f in skymap_filenames]
 
     ##############################
     ###        AGN flares      ###
@@ -107,7 +103,7 @@ def mock_data(
 
     # Select flare locations
     position_flare_gws = [
-        sm.draw_random_location(np.linspace(0, 1, 1000), ci_followup)
+        sm.draw_random_location(np.linspace(0, 1, 100)[:1], ci_followup)
         for sm in skymap_flare_gws
     ]
 
@@ -125,8 +121,7 @@ def mock_data(
     ### Background flares
 
     # Get GW event times, order by time
-    # NOTE: this will probably not work; will need to adjust Skymap to read the time from the header
-    time_gws = [Time(sm["DATE_OBS"], format="isot", scale="utc") for sm in gw_skymaps]
+    time_gws = [Time(sm.skymap.meta["gps_time"], format="gps") for sm in gw_skymaps]
     ind_gw_time = np.argsort(time_gws)
 
     # Iterate over GW events in time order
@@ -150,31 +145,42 @@ def mock_data(
 
         # Add mask for hpxs in ci_followup
         hpxs = skymap_ti_flat.get_hpxs_for_ci_areas(ci_followup)[0]
-        skymap_ti_flat["INCIFOLLOWUP"] = False
-        skymap_ti_flat["INCIFOLLOWUP"][hpxs] = True
+        skymap_ti_flat.skymap["INCIFOLLOWUP"] = False
+        skymap_ti_flat.skymap["INCIFOLLOWUP"][hpxs] = True
 
         ## Add columns for minimum/maximum redshift
         # Iterate over healpixs
         zmins = []
         zmaxs = []
-        for i in np.arange(len(skymap_ti_flat)):
-            # Get healpix
-            hpx = skymap_ti_flat[i]
+        for i in np.arange(len(skymap_ti_flat.skymap)):
+            # Set to background max/min if not in followup
+            if not skymap_ti_flat.skymap[i]["INCIFOLLOWUP"]:
+                zmins.append(background_z_grid.min())
+                zmaxs.append(background_z_grid.max())
+                continue
 
-            # Get dp_ddL
-            dp_dz = skymap_ti.dp_dz(background_z_grid, hpx)
+            # Get dp_dz
+            dp_dz = skymap_ti_flat.dp_dz(background_z_grid, i)
 
             # Ensure probability sums to at least background_z_frac
-            if np.trapezoid(dp_dz, background_z_grid) < background_z_frac:
-                raise ValueError(
-                    "dp_dz does not sum to at least background_z_frac; perhaps expand background_z_grid?"
+            if np.trapz(dp_dz, background_z_grid) < background_z_frac:
+                print(
+                    "WARNING: dp_dz does not sum to at least background_z_frac; setting zmin and zmax to min and max of z_grid"
                 )
+                zmins.append(background_z_grid.min())
+                zmaxs.append(background_z_grid.max())
+                continue
+                # raise ValueError(
+                #     "dp_dz does not sum to at least background_z_frac; perhaps expand background_z_grid?"
+                # )
 
             # Get background_z_frac bounds
             argsort_dp_dz = np.argsort(dp_dz)[::-1]
-            dp_dz_sorted = dp_dz[argsort_dp_dz]
-            dp_dz_cumsum = np.cumsum(dp_dz_sorted)
-            ind_ci_cutoff = np.searchsorted(dp_dz_cumsum, background_z_frac)
+            prob_sorted = dp_dz[argsort_dp_dz] * (
+                background_z_grid[1] - background_z_grid[0]
+            )
+            prob_cumsum = np.cumsum(prob_sorted)
+            ind_ci_cutoff = np.searchsorted(prob_cumsum, background_z_frac)
             z_grid_ci = background_z_grid[argsort_dp_dz[:ind_ci_cutoff]]
             zmin = z_grid_ci.min()
             zmax = z_grid_ci.max()
@@ -190,7 +196,7 @@ def mock_data(
         # Add to active lists
         ti_actives.append(ti)
         time_actives.append(time_ti)
-        skymap_actives.append(skymap_ti_flat)
+        skymap_actives.append(skymap_ti_flat.skymap)
 
         # Recalculate active skymap
         active_skymap = _calc_active_skymap(skymap_actives)

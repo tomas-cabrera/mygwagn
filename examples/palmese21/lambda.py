@@ -4,7 +4,7 @@ import astropy.units as u
 import numpy as np
 from astropy.cosmology import FlatLambdaCDM
 from myagn.distributions import ConstantPhysicalDensity
-from myagn.flares import ConstantRate
+from myagn.flares.models import ConstantRate
 from mygw.io.skymaps import GWTCCache, Skymap
 
 from mygwagn.inference.palmese21 import Lambda, mock_data
@@ -25,11 +25,11 @@ gwcache = GWTCCache(cache_dir=cache_dir)
 # Generate mock dataset
 lambda_ = 0.3
 gw_skymaps, agn_flares, assoc_matrix = mock_data(
-    gwcache.cache_dir,
+    pa.join(gwcache.cache_dir, "GWTC2.1"),
     lambda_=lambda_,
     agn_distribution=ConstantPhysicalDensity(10**-4.75 * u.Mpc**-3),
     flare_model=ConstantRate(1e-4 / 200 / u.day),
-    n_gw=100,
+    n_gw=50,
     ci_followup=0.9,
     Dt_followup=200 * u.day,
     background_skymap_level=5,
