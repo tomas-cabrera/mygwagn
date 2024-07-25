@@ -33,13 +33,17 @@ gw_skymaps, agn_flares, assoc_matrix = mock_data(
     ci_followup=0.9,
     Dt_followup=200 * u.day,
     background_skymap_level=5,
-    background_z_grid=np.linspace(0, 1, 100),
+    background_z_grid=np.linspace(0, 1, 101),
     background_z_frac=0.9,
     cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
-    rng_np=np.random.default_rng(12345),
+    rng=np.random.default_rng(12345),
     use_exact_rates=False,
     independent_gws=False,
 )
+
+print("# gw_skymaps:", len(gw_skymaps))
+print("# agn_flares:", len(agn_flares))
+print("assoc_matrix.shape:", assoc_matrix.shape)
 
 ##############################
 ###       Inference        ###

@@ -1,8 +1,10 @@
 import glob
 import multiprocessing as mp
 import os.path as pa
+from copy import copy
 
 import astropy.units as u
+import astropy_healpix as ah
 import emcee
 import healpy as hp
 import ligo.skymap.moc as lsm_moc
@@ -12,6 +14,7 @@ from astropy.cosmology import FlatLambdaCDM
 from astropy.table import QTable
 from astropy.time import Time
 from ligo.skymap.io.fits import write_sky_map
+from ligo.skymap.postprocess.crossmatch import crossmatch
 from myagn.flares.flares import Flare
 from mygw.io.skymaps import Skymap
 
@@ -35,6 +38,10 @@ def _calc_active_skymap(active_skymaps):
     zmin_arr = np.array([asm["ZMIN"] for asm in active_skymaps])
     zmax_arr = np.array([asm["ZMAX"] for asm in active_skymaps])
 
+    # Set inactive hpx zs to nan to avoid affecting min, max
+    zmin_arr[~hpx_arr] = np.nan
+    zmax_arr[~hpx_arr] = np.nan
+
     # Get min, max zmins, zmaxs
     zmin = np.nanmin(zmin_arr, axis=0)
     zmax = np.nanmax(zmax_arr, axis=0)
@@ -52,6 +59,157 @@ def _calc_active_skymap(active_skymaps):
     return active_skymap
 
 
+def _calc_n_flares(
+    t0,
+    t1,
+    active_skymap,
+    flare_model,
+    cosmo,
+    use_exact_rates,
+    rng,
+):
+
+    # Calculate n_agn in active volume
+    # TODO: Broaden this to allow for redshift-dependent AGN distributions and other flare models
+    # Calculate prism volumes for each hpx by dividing comoving volume difference by number of pixels
+    # prism volume = (4/3 pi d_comoving(zmax)^3 - 4/3 pi d_comoving(zmax)^3) / n_pix
+    active_volume_prisms = (
+        cosmo.comoving_volume(
+            active_skymap["ZMAX"],
+        )
+        - cosmo.comoving_volume(
+            active_skymap["ZMIN"],
+        )
+    ) / len(active_skymap)
+    # Sum to get total active volume
+    active_volume = active_volume_prisms[active_skymap["INCIFOLLOWUP"]].sum()
+
+    # Calculate expected n_flares by multiplying by flat rates
+    n_flares = (
+        active_volume * (10**-4.75 * u.Mpc**-3) * flare_model.flare_rate() * (t1 - t0)
+    )
+    print("n_flares")
+    print(n_flares)
+    n_flares = n_flares.to_value(u.dimensionless_unscaled)
+    print(n_flares)
+
+    # Set/draw n_flares
+    if use_exact_rates:
+        n_flares = round(n_flares.to_value(u.dimensionless_unscaled))
+        pass
+    else:
+        n_flares = rng.poisson(n_flares)
+    print(n_flares)
+
+    return n_flares
+
+
+def _sample_flare_coords(
+    n_flares,
+    t0,
+    t1,
+    active_skymap,
+    agn_distribution,
+    rng,
+):
+    # Sample flare times
+    time_flare_backgrounds = rng.uniform(t0.mjd, t1.mjd, n_flares) * u.day
+
+    # Sample hpx; get ra, dec
+    hpx_flare_backgrounds = rng.choice(
+        np.arange(len(active_skymap)),
+        n_flares,
+        p=active_skymap["INCIFOLLOWUP"] / active_skymap["INCIFOLLOWUP"].sum(),
+        replace=True,
+    )
+    ra_flare_backgrounds, dec_flare_backgrounds = (
+        hp.pix2ang(
+            ah.npix_to_nside(len(active_skymap)),
+            hpx_flare_backgrounds,
+            lonlat=True,
+        )
+        * u.deg
+    )
+
+    # Sample redshifts
+    z_flare_backgrounds = []
+    for hpx in hpx_flare_backgrounds:
+        # Choose redshift
+        z = agn_distribution.sample_z(
+            1,
+            z_grid=np.linspace(
+                active_skymap["ZMIN"][hpx],
+                active_skymap["ZMAX"][hpx],
+                101,
+            ),
+            rng_np=rng,
+        )[0]
+
+        # Append to list
+        z_flare_backgrounds.append(z)
+
+    # Compile flare coordinates
+    coord_flares = np.array(
+        [
+            time_flare_backgrounds,
+            ra_flare_backgrounds.to(u.deg).value,
+            dec_flare_backgrounds.to(u.deg).value,
+            z_flare_backgrounds,
+        ]
+    ).T
+
+    return coord_flares
+
+
+def _update_flares(
+    t0,
+    t1,
+    coord_flares,
+    coord_flare_gws,
+    gw_skymaps_flat,
+    active_mask,
+    agn_flares,
+    assoc_matrix,
+):
+    # Copy agn_flares, assoc_matrix
+    agn_flares_temp = copy(agn_flares)
+    assoc_matrix_temp = copy(assoc_matrix)
+
+    # Add gw flares in time interval
+    for cfgw in coord_flare_gws:
+        if t0 <= cfgw[0] < t1:
+            cfgw_temp = copy(cfgw)
+            cfgw_temp[1] = cfgw_temp[1].to(u.deg).value
+            cfgw_temp[2] = cfgw_temp[2].to(u.deg).value
+            coord_flares = np.vstack([coord_flares, cfgw_temp])
+
+    # Iterate over flares
+    for cf in coord_flares:
+        # Initialize row
+        assoc_row = np.zeros(len(gw_skymaps_flat), dtype=bool)
+
+        # Get flare hpx
+        hpx = hp.ang2pix(
+            ah.npix_to_nside(len(gw_skymaps_flat[0].skymap)),
+            cf[1],
+            cf[2],
+            lonlat=True,
+            nest=True,
+        )
+
+        # Iterate over active GWs
+        for tia in np.arange(len(gw_skymaps_flat)):
+            if active_mask[tia]:
+                if gw_skymaps_flat[tia].skymap["INCIFOLLOWUP"][hpx]:
+                    assoc_row[tia] = True
+
+        # Append to agn_flares, assoc_matrix
+        agn_flares_temp.append(Flare(*cf))
+        assoc_matrix_temp.append(assoc_row)
+
+    return agn_flares_temp, assoc_matrix_temp
+
+
 def mock_data(
     skymap_dir,
     lambda_,
@@ -61,10 +219,10 @@ def mock_data(
     ci_followup=0.9,
     Dt_followup=200 * u.day,
     background_skymap_level=5,
-    background_z_grid=np.linspace(0, 1, 100),
+    background_z_grid=np.linspace(0, 1, 101),
     background_z_frac=0.9,
     cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
-    rng_np=np.random.default_rng(12345),
+    rng=np.random.default_rng(12345),
     use_exact_rates=False,
     independent_gws=False,
 ):
@@ -77,7 +235,7 @@ def mock_data(
     skymap_filenames = glob.glob(pa.join(skymap_dir, "*IMRPhenomXPHM.fits"))
 
     # Choose n_gw skymaps
-    skymap_filenames = rng_np.choice(skymap_filenames, n_gw, replace=False)
+    skymap_filenames = rng.choice(skymap_filenames, n_gw, replace=False)
 
     # Initialize skymaps
     gw_skymaps = [Skymap(f, moc=True) for f in skymap_filenames]
@@ -93,17 +251,17 @@ def mock_data(
     if use_exact_rates:
         n_flares_gw = round(n_flares_gw_expected)
     else:
-        n_flares_gw = rng_np.poisson(n_flares_gw_expected)
+        n_flares_gw = rng.poisson(n_flares_gw_expected)
         n_flares_gw = max(n_flares_gw, n_gw)
 
     # Select gw events for flares
     i_gws = np.arange(n_gw)
-    i_flare_gws = rng_np.choice(i_gws, n_flares_gw, replace=False)
+    i_flare_gws = rng.choice(i_gws, n_flares_gw, replace=False)
     skymap_flare_gws = [gw_skymaps[i] for i in i_flare_gws]
 
     # Select flare locations
     position_flare_gws = [
-        sm.draw_random_location(np.linspace(0, 1, 100)[:1], ci_followup)
+        sm.draw_random_location(np.linspace(0, 1, 101)[:1], ci_followup)
         for sm in skymap_flare_gws
     ]
 
@@ -112,55 +270,43 @@ def mock_data(
         times_flare_gws = [Dt_followup / 2] * n_flares_gw
     else:
         times_flare_gws = (
-            rng_np.uniform(0, Dt_followup.to(u.day).value, n_flares_gw) * u.day
+            rng.uniform(0, Dt_followup.to(u.day).value, n_flares_gw) * u.day
         )
+    times_flare_gws = [
+        Time(sm.skymap.meta["gps_time"], format="gps") + t
+        for sm, t in zip(skymap_flare_gws, times_flare_gws)
+    ]
 
     # Combine coordinates
     coord_flare_gws = [[t, *x] for t, x in zip(times_flare_gws, position_flare_gws)]
 
     ### Background flares
 
-    # Get GW event times, order by time
-    time_gws = [Time(sm.skymap.meta["gps_time"], format="gps") for sm in gw_skymaps]
-    ind_gw_time = np.argsort(time_gws)
-
-    # Iterate over GW events in time order
-    ti_actives = []
-    time_actives = []
-    skymap_actives = []
-    agn_flares = []
-    assoc_matrix = []
-    for ti, ti_next in zip(ind_gw_time, np.roll(ind_gw_time, -1)):
-
-        ##############################
-        ###  Add activated skymap  ###
-        ##############################
-
-        # Get time, skymap
-        time_ti = time_gws[ti]
-        skymap_ti = gw_skymaps[ti]
-
+    ## Rasterize GW skymaps for easier volume calculations
+    gw_skymaps_flat = []
+    for sm in gw_skymaps:
         # Flatten skymap
-        skymap_ti_flat = skymap_ti.flatten(background_skymap_level)
+        sm_flat = sm.flatten(background_skymap_level)
 
+        ## 2D CI masking
         # Add mask for hpxs in ci_followup
-        hpxs = skymap_ti_flat.get_hpxs_for_ci_areas(ci_followup)[0]
-        skymap_ti_flat.skymap["INCIFOLLOWUP"] = False
-        skymap_ti_flat.skymap["INCIFOLLOWUP"][hpxs] = True
+        hpxs = sm_flat.get_hpxs_for_ci_areas(ci_followup)[0]
+        sm_flat.skymap["INCIFOLLOWUP"] = False
+        sm_flat.skymap["INCIFOLLOWUP"][hpxs] = True
 
         ## Add columns for minimum/maximum redshift
         # Iterate over healpixs
         zmins = []
         zmaxs = []
-        for i in np.arange(len(skymap_ti_flat.skymap)):
+        for i in np.arange(len(sm_flat.skymap)):
             # Set to background max/min if not in followup
-            if not skymap_ti_flat.skymap[i]["INCIFOLLOWUP"]:
+            if not sm_flat.skymap[i]["INCIFOLLOWUP"]:
                 zmins.append(background_z_grid.min())
                 zmaxs.append(background_z_grid.max())
                 continue
 
             # Get dp_dz
-            dp_dz = skymap_ti_flat.dp_dz(background_z_grid, i)
+            dp_dz = sm_flat.dp_dz(background_z_grid, i)
 
             # Ensure probability sums to at least background_z_frac
             if np.trapz(dp_dz, background_z_grid) < background_z_frac:
@@ -173,6 +319,13 @@ def mock_data(
                 # raise ValueError(
                 #     "dp_dz does not sum to at least background_z_frac; perhaps expand background_z_grid?"
                 # )
+            if np.trapz(dp_dz, background_z_grid) > 10:
+                print(
+                    "WARNING: dp_dz sums to > 1000%; setting zmin and zmax to min and max of z_grid"
+                )
+                zmins.append(background_z_grid.min())
+                zmaxs.append(background_z_grid.max())
+                continue
 
             # Get background_z_frac bounds
             argsort_dp_dz = np.argsort(dp_dz)[::-1]
@@ -190,16 +343,32 @@ def mock_data(
             zmaxs.append(zmax)
 
         # Add to skymap
-        skymap_ti_flat["ZMIN"] = zmins
-        skymap_ti_flat["ZMAX"] = zmaxs
+        sm_flat.skymap["ZMIN"] = zmins
+        sm_flat.skymap["ZMAX"] = zmaxs
 
-        # Add to active lists
-        ti_actives.append(ti)
-        time_actives.append(time_ti)
-        skymap_actives.append(skymap_ti_flat.skymap)
+        ## Append to list
+        gw_skymaps_flat.append(sm_flat)
 
-        # Recalculate active skymap
-        active_skymap = _calc_active_skymap(skymap_actives)
+    # Get GW event times, order by time
+    time_gws = [
+        Time(sm.skymap.meta["gps_time"], format="gps") for sm in gw_skymaps_flat
+    ]
+    ind_gw_time = np.argsort(time_gws)
+
+    # Iterate over GW events in time order
+    active_mask = [False] * n_gw
+    agn_flares = []
+    assoc_matrix = []
+    for ti, ti_next in zip(ind_gw_time, np.roll(ind_gw_time, -1)):
+        print(f"Processing GW event #{ti}/{n_gw}")
+
+        ##############################
+        ###  Add activated skymap  ###
+        ##############################
+
+        # Mark as active
+        print(f"Setting GW event {ti} as active (Time {time_gws[ti]})")
+        active_mask[ti] = True
 
         ##############################
         ###Process terminating GWs ###
@@ -210,133 +379,147 @@ def mock_data(
             time_next = Time("9999-12-31T23:59:59", format="isot", scale="utc")
         else:
             time_next = time_gws[ti_next]
+        print(f"Next GW event is at {time_next}")
 
-        # Iterate through times (assumes the actives have remained in time order)
-        time_start = time_ti
-        i_terminate = 0
-        time_terminate = time_actives[i_terminate]
-        while time_terminate < time_next:
+        # Check active skymaps for termination (in time order)
+        t0 = time_gws[ti]
+        for tti in ind_gw_time:
+            # Skip those that are not active
+            if not active_mask[tti]:
+                print(f"GW event {tti} is not active; skipping")
+                continue
+
+            # Set termination time
+            t1 = time_gws[tti] + Dt_followup
+
+            # Skip those that have already terminated
+            if t1 < t0:
+                print(f"GW event {tti} has already terminated; skipping")
+                continue
+
+            # Skip those that do not terminate before the next GW event
+            if t1 >= time_next:
+                print(f"GW event {tti} does not terminate before next event; skipping")
+                continue
+
+            print(f"GW event {tti} terminates (Time {t1})")
 
             ##############################
             ###  Get number of flares  ###
             ##############################
 
-            # Calculate n_agn in active volume
-            # TODO: Broaden this to allow for redshift-dependent AGN distributions and other flare models
-            # Calculate prism volumes for each hpx by dividing comoving volume difference by number of pixels
-            # prism volume = (4/3 pi d_comoving(zmax)^3 - 4/3 pi d_comoving(zmax)^3) / n_pix
-            active_volume_prisms = cosmo.comoving_volume(
-                active_skymap["ZMAX"],
-            ) - cosmo.comoving_volume(
-                active_skymap["ZMIN"],
-            ) / hp.order2npix(
-                background_skymap_level
-            )
-            # Sum to get total active volume
-            active_volume = active_volume_prisms.sum()
-
-            # Calculate n_flares by multiplying by flat rates
-            n_flares = (
-                active_volume
-                * (10**-4.75 * u.Mpc**-3)
-                * flare_model.flare_rate()
-                * (time_terminate - time_start)
+            # Recalculate active skymap from active skymaps
+            active_skymap = _calc_active_skymap(
+                [gsf.skymap for (am, gsf) in zip(active_mask, gw_skymaps_flat) if am]
             )
 
-            ##############################
-            ###Sample flare coordinates###
-            ##############################
-
-            # Sample flare times
-            time_flare_backgrounds = (
-                rng_np.uniform(time_start.mjd, time_terminate.mjd, n_flares) * u.day
+            n_flares = _calc_n_flares(
+                t0,
+                t1,
+                active_skymap,
+                flare_model,
+                cosmo,
+                use_exact_rates,
+                rng,
             )
 
-            # Sample hpx; get ra, dec
-            hpx_flare_backgrounds = rng_np.choice(
-                np.arange(len(active_skymap)),
-                n_flares,
-                p=active_skymap["INCIFOLLOWUP"],
-                replace=True,
-            )
-            ra_flare_backgrounds, dec_flare_backgrounds = (
-                hp.pix2ang(
-                    hp.order2nside(background_skymap_level),
-                    hpx_flare_backgrounds,
-                    lonlat=True,
-                )
-                * u.deg
-            )
+            # Draw coords if n_flares > 0
+            if n_flares > 0:
 
-            # Sample redshifts
-            z_flare_backgrounds = []
-            for hpx in hpx_flare_backgrounds:
-                # Choose redshift
-                z = agn_distribution.sample_z(
-                    1,
-                    z_grid=np.linspace(
-                        active_skymap["ZMIN"][hpx],
-                        active_skymap["ZMAX"][hpx],
-                        100,
-                    ),
-                    rng_np=rng_np,
-                )[0]
+                ##############################
+                ###Sample flare coordinates###
+                ##############################
 
-                # Append to list
-                z_flare_backgrounds.append(z)
-
-            # Compile flare coordinates
-            coord_flares = np.array(
-                [
-                    time_flare_backgrounds,
-                    ra_flare_backgrounds,
-                    dec_flare_backgrounds,
-                    z_flare_backgrounds,
-                ]
-            ).T
-
-            ##############################
-            ###  Update assoc_matrix   ###
-            ##############################
-
-            # Add gw flares in time interval
-            for cfgw in coord_flare_gws:
-                if time_start <= cfgw[0] < time_terminate:
-                    coord_flares = np.vstack([coord_flares, cfgw])
-
-            # Iterate over flares
-            for cf in coord_flares:
-                # Initialize row
-                assoc_row = np.zeros(n_gw, dtype=bool)
-
-                # Get flare hpx
-                hpx = hp.ang2pix(
-                    hp.order2nside(background_skymap_level),
-                    cf[1].deg,
-                    cf[2].deg,
-                    lonlat=True,
-                    nest=True,
+                coord_flares = _sample_flare_coords(
+                    n_flares,
+                    t0,
+                    t1,
+                    active_skymap,
+                    agn_distribution,
+                    rng,
                 )
 
-                # Iterate over active GWs
-                for tia in ti_actives:
-                    if skymap_actives[tia]["INCIFOLLOWUP"][hpx]:
-                        assoc_row[tia] = True
+                ##############################
+                ###  Update assoc_matrix   ###
+                ##############################
 
-                # Append to agn_flares, assoc_matrix
-                agn_flares.append(Flare(*cf))
-                assoc_matrix.append(assoc_row)
+                agn_flares, assoc_matrix = _update_flares(
+                    t0,
+                    t1,
+                    coord_flares,
+                    coord_flare_gws,
+                    gw_skymaps_flat,
+                    active_mask,
+                    agn_flares,
+                    assoc_matrix,
+                )
 
             ##############################
             ###      Cleanup loop      ###
             ##############################
 
             # Update time_start
-            time_start = time_terminate
+            t0 = t1
 
-            # Update i_terminate, time_terminate
-            i_terminate += 1
-            time_terminate = time_actives[i_terminate]
+            # Mark terminated flare as inactive
+            print(f"Setting GW event {tti} as inactive (Time {time_gws[tti]})")
+            active_mask[tti] = False
+
+        ### Cover time block before next GW event begins
+        t1 = time_next
+
+        # If any GWs are active, get flares
+        if np.any(active_mask):
+
+            ##############################
+            ###  Get number of flares  ###
+            ##############################
+
+            # Recalculate active skymap from active skymaps
+            active_skymap = _calc_active_skymap(
+                [gsf.skymap for (am, gsf) in zip(active_mask, gw_skymaps_flat) if am]
+            )
+
+            n_flares = _calc_n_flares(
+                t0,
+                t1,
+                active_skymap,
+                flare_model,
+                cosmo,
+                use_exact_rates,
+                rng,
+            )
+
+            # Draw coords if n_flares > 0
+            if n_flares > 0:
+
+                ##############################
+                ###Sample flare coordinates###
+                ##############################
+
+                coord_flares = _sample_flare_coords(
+                    n_flares,
+                    t0,
+                    t1,
+                    active_skymap,
+                    agn_distribution,
+                    rng,
+                )
+
+                ##############################
+                ###  Update assoc_matrix   ###
+                ##############################
+
+                agn_flares, assoc_matrix = _update_flares(
+                    t0,
+                    t1,
+                    coord_flares,
+                    coord_flare_gws,
+                    gw_skymaps_flat,
+                    active_mask,
+                    agn_flares,
+                    assoc_matrix,
+                )
 
     ##############################
     ###        Return          ###
@@ -359,7 +542,7 @@ class Palmese21:
         agn_distribution,
         flare_model,
         cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
-        z_grid=np.linspace(0, 1, 1000),
+        z_grid=np.linspace(0, 1, 1001),
         ci_prob=0.9,
     ):
         # Forward objects
@@ -378,7 +561,10 @@ class Palmese21:
         # Set flare hpxs (same dimensions as assoc_matrix)
         self.hpx_flares = np.array(
             [
-                [sm.skycoord_to_healpix(SkyCoord(f.ra, f.dec)) for f in self.agn_flares]
+                [
+                    sm.skycoord2pix(SkyCoord(f.ra, f.dec, unit=u.deg))
+                    for f in self.agn_flares
+                ]
                 for sm in self.gw_skymaps
             ]
         )
