@@ -115,20 +115,30 @@ def _sample_flare_coords(
     # Sample flare times
     time_flare_backgrounds = rng.uniform(t0.mjd, t1.mjd, n_flares) * u.day
 
-    # Sample hpx; get ra, dec
+    # Sample hpx
     hpx_flare_backgrounds = rng.choice(
         np.arange(len(active_skymap)),
         n_flares,
         p=active_skymap["INCIFOLLOWUP"] / active_skymap["INCIFOLLOWUP"].sum(),
         replace=True,
     )
+
+    # Choose random ra, dec in hpxs
+    dx, dy = rng.uniform(0, 1, (2, n_flares))
     ra_flare_backgrounds, dec_flare_backgrounds = (
-        hp.pix2ang(
-            ah.npix_to_nside(len(active_skymap)),
+        ah.healpix_to_lonlat(
             hpx_flare_backgrounds,
-            lonlat=True,
+            ah.npix_to_nside(len(active_skymap)),
+            order="nested",
+            dx=dx,
+            dy=dy,
         )
-        * u.deg
+        # hp.pix2ang(
+        #     ah.npix_to_nside(len(active_skymap)),
+        #     hpx_flare_backgrounds,
+        #     lonlat=True,
+        # )
+        # * u.deg
     )
 
     # Sample redshifts
@@ -189,12 +199,11 @@ def _update_flares(
         assoc_row = np.zeros(len(gw_skymaps_flat), dtype=bool)
 
         # Get flare hpx
-        hpx = hp.ang2pix(
-            ah.npix_to_nside(len(gw_skymaps_flat[0].skymap)),
-            cf[1],
-            cf[2],
-            lonlat=True,
-            nest=True,
+        hpx = ah.lonlat_to_healpix(
+            cf[1] * u.deg,
+            cf[2] * u.deg,
+            nside=ah.npix_to_nside(len(gw_skymaps_flat[0].skymap)),
+            order="nested",
         )
 
         # Iterate over active GWs
@@ -531,7 +540,7 @@ def mock_data(
     return gw_skymaps, agn_flares, assoc_matrix
 
 
-class Palmese21:
+class Framework:
     """Base class for Palmese21-like analyses."""
 
     def __init__(
@@ -544,6 +553,7 @@ class Palmese21:
         cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
         z_grid=np.linspace(0, 1, 1001),
         ci_prob=0.9,
+        Dt_followup=200 * u.day,
     ):
         # Forward objects
         self.gw_skymaps = gw_skymaps
@@ -554,6 +564,7 @@ class Palmese21:
         self.cosmo = cosmo
         self.z_grid = z_grid
         self.ci_prob = ci_prob
+        self.Dt_followup = Dt_followup
 
         # Set gw/flare indices
         self.ind_gw, self.ind_flare = np.where(self.assoc_matrix)
@@ -562,7 +573,7 @@ class Palmese21:
         self.hpx_flares = np.array(
             [
                 [
-                    sm.skycoord2pix(SkyCoord(f.ra, f.dec, unit=u.deg))
+                    sm.skycoord2pix(SkyCoord(f.ra, f.dec, unit=u.deg), moc_level_max=12)
                     for f in self.agn_flares
                 ]
                 for sm in self.gw_skymaps
@@ -591,22 +602,22 @@ class Palmese21:
         s_arr = np.zeros((len(self.gw_skymaps), len(self.agn_flares)))
 
         # Get skymaps, flares
-        skymaps = self.gw_skymaps[self.ind_gw]
-        flares = self.agn_flares[self.ind_flare]
+        skymaps = [self.gw_skymaps[i] for i in self.ind_gw]
+        flares = [self.agn_flares[i] for i in self.ind_flare]
 
         # Get hpx indices of flare locations
         hpx_flares = self.hpx_flares[self.ind_gw, self.ind_flare]
 
         # Calculate dp_dOmega
         dp_dOmega = (
-            u.quantity([sm.dp_dOmega(i) for sm, i in zip(skymaps, hpx_flares)])
+            u.Quantity([sm.dp_dOmega(i) for sm, i in zip(skymaps, hpx_flares)])
             / self.ci_prob
         )
 
         # Calculate dp_dz
-        dp_dz = u.quantity(
+        dp_dz = u.Quantity(
             [
-                sm.dp_dz(self.z_grid, i, f.z)
+                sm.dp_dz(f.z, i, cosmo=cosmo)
                 for sm, f, i in zip(skymaps, flares, hpx_flares)
             ]
         )
@@ -615,7 +626,7 @@ class Palmese21:
         s_values = dp_dOmega * dp_dz
 
         # Set values in s_arr
-        s_arr[self.assoc_matrix] = s_values
+        s_arr[self.assoc_matrix] = s_values.flatten()
 
         return s_arr  # Shape: (n_skymaps, n_flares)
 
@@ -642,16 +653,20 @@ class Palmese21:
         b_arr = np.zeros((len(self.gw_skymaps), len(self.agn_flares)))
 
         # Fetch flares, flare redshifts
-        flares = self.agn_flares[self.ind_flare]
+        flares = [self.agn_flares[i] for i in self.ind_flare]
         z_flares = [f.z for f in flares]
 
         # Calculate values
-        b_values = self.agn_distribution.dp_dOmega_dz(
-            z_grid=self.z_grid,
-            z_evaluate=z_flares,
-            cosmo=cosmo,
-            brightness_limits=brightness_limits,
-        ) * self.flare_model.p_flare(flares)
+        b_values = (
+            self.agn_distribution.dp_dOmega_dz(
+                z_grid=self.z_grid,
+                z_evaluate=z_flares,
+                cosmo=cosmo,
+                brightness_limits=brightness_limits,
+            )
+            * self.Dt_followup
+            * self.flare_model.flare_rate(flares)
+        )
 
         # Set values in b_arr
         b_arr[self.assoc_matrix] = b_values
@@ -662,33 +677,33 @@ class Palmese21:
         return lambda_ * np.ones(len(self.gw_skymaps))
 
 
-class Lambda(Palmese21):
+class Lambda:
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # super().__init__(*args, **kwargs)
+        pass
 
-    def set_arrs(self, cosmo=None):
-        # Get cosmo
-        cosmo = self.get_cosmo(cosmo)
-
+    def set_arrs(self, inference, lambda_, cosmo):
         # Calculate signal terms
-        self.s_arr = self.calc_s_arr(cosmo=cosmo)
+        self.s_arr = inference.calc_s_arr(cosmo=cosmo)
 
         # Calculate background terms
-        self.b_arr = self.calc_b_arr(cosmo=cosmo)
+        self.b_arr = inference.calc_b_arr(cosmo=cosmo)
 
         # Calculate mu terms
-        self.mu_arr = self.calc_mu_arr(cosmo=cosmo)
+        self.mu_arr = inference.calc_mu_arr(lambda_, cosmo=cosmo)
 
     def ln_prior(self, lambda_):
         # If in ok domain, return 0; otheriwse return -inf
-        if 0.0 < lambda_ < 1.0:
+        if 0.0 <= lambda_ <= 1.0:
             return 0.0
         return -np.inf
 
     def ln_likelihood(self, lambda_):
         # Calculate likelihood
         ln_likelihood = (
-            np.sum(np.log(lambda_ * self.s_arr + self.b_arr)) - self.mu_arr.sum()
+            np.sum(np.log(lambda_ * self.s_arr + self.b_arr))
+            # - self.calc_mu_arr(lambda_).sum()
+            - lambda_ * self.s_arr.shape[0]
         )
 
         return ln_likelihood
@@ -697,23 +712,36 @@ class Lambda(Palmese21):
         # Evaluate prior
         ln_prior = self.ln_prior(lambda_)
 
-        # Evaluate likelihood
-        ln_likelihood = self.ln_likelihood(lambda_, self.s_arr, self.b_arr, self.mu_arr)
+        # Return -inf if prior is inf
+        if not np.isfinite(ln_prior):
+            return -np.inf
+
+        # Evaluate likelihood, after updating mu_arr
+        ln_likelihood = self.ln_likelihood(lambda_)
 
         # Combine into posterior
         ln_posterior = ln_prior + ln_likelihood
 
         return ln_posterior
 
-    def run_mcmc(self, lambda_0=0.5, cosmo=None, n_walkers=32, n_steps=5000, n_proc=32):
-        # Get cosmo
-        cosmo = self.get_cosmo(cosmo)
+    def run_mcmc(
+        self,
+        inference=None,
+        lambda_0=0.5,
+        cosmo=None,
+        n_walkers=32,
+        n_steps=5000,
+        n_proc=32,
+    ):
+        # # Get cosmo
+        # cosmo = self.get_cosmo(cosmo)
 
         # Set arrays
-        self.set_arrs(cosmo=cosmo)
+        self.set_arrs(inference, lambda_0, cosmo)
 
-        # Initial lambdas
-        initial_state = lambda_0 + np.random.randn(n_walkers)
+        # Initial lambdas; clip to 0, 1
+        initial_state = lambda_0 + 1e-4 * np.random.randn(n_walkers, 1)
+        initial_state = np.clip(initial_state, 0.0, 1.0)
 
         # Define sampler args
         args_sampler = {
@@ -727,7 +755,7 @@ class Lambda(Palmese21):
         # Define run_mcmc args
         args_run_mcmc = {
             "initial_state": initial_state,
-            "n_steps": n_steps,
+            "nsteps": n_steps,
         }
         # Define run_mcmc kwargs
         kwargs_run_mcmc = {
@@ -758,6 +786,110 @@ class Lambda(Palmese21):
                 sampler.run_mcmc(**args_run_mcmc, **kwargs_run_mcmc)
 
         return sampler
+
+
+# class Lambda(Palmese21):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+
+#     def set_arrs(self, lambda_, cosmo=None):
+#         # Get cosmo
+#         cosmo = self.get_cosmo(cosmo)
+
+#         # Calculate signal terms
+#         self.s_arr = self.calc_s_arr(cosmo=cosmo)
+
+#         # Calculate background terms
+#         self.b_arr = self.calc_b_arr(cosmo=cosmo)
+
+#         # Calculate mu terms
+#         self.mu_arr = self.calc_mu_arr(lambda_, cosmo=cosmo)
+
+#     def ln_prior(self, lambda_):
+#         # If in ok domain, return 0; otheriwse return -inf
+#         if 0.0 <= lambda_ <= 1.0:
+#             return 0.0
+#         return -np.inf
+
+#     def ln_likelihood(self, lambda_):
+#         # Calculate likelihood
+#         ln_likelihood = (
+#             np.sum(np.log(lambda_ * self.s_arr + self.b_arr))
+#             - self.calc_mu_arr(lambda_).sum()
+#         )
+
+#         return ln_likelihood
+
+#     def ln_posterior(self, lambda_):
+#         # Evaluate prior
+#         ln_prior = self.ln_prior(lambda_)
+
+#         # Return -inf if prior is inf
+#         if not np.isfinite(ln_prior):
+#             return -np.inf
+
+#         # Evaluate likelihood, after updating mu_arr
+#         ln_likelihood = self.ln_likelihood(lambda_)
+
+#         # Combine into posterior
+#         ln_posterior = ln_prior + ln_likelihood
+
+#         return ln_posterior
+
+#     def run_mcmc(self, lambda_0=0.5, cosmo=None, n_walkers=32, n_steps=5000, n_proc=32):
+#         # Get cosmo
+#         cosmo = self.get_cosmo(cosmo)
+
+#         # Set arrays
+#         self.set_arrs(lambda_0, cosmo=cosmo)
+
+#         # Initial lambdas; clip to 0, 1
+#         initial_state = lambda_0 + 1e-4 * np.random.randn(n_walkers, 1)
+#         initial_state = np.clip(initial_state, 0.0, 1.0)
+
+#         # Define sampler args
+#         args_sampler = {
+#             "nwalkers": n_walkers,
+#             "ndim": 1,
+#             "log_prob_fn": self.ln_posterior,
+#         }
+
+#         # Define sampler kwargs
+#         kwargs_sampler = {}
+#         # Define run_mcmc args
+#         args_run_mcmc = {
+#             "initial_state": initial_state,
+#             "nsteps": n_steps,
+#         }
+#         # Define run_mcmc kwargs
+#         kwargs_run_mcmc = {
+#             "progress": True,
+#         }
+
+#         # If n_proc=1, run without multiprocessing
+#         if n_proc == 1:
+#             # Initialize sampler
+#             sampler = emcee.EnsembleSampler(
+#                 **args_sampler,
+#                 **kwargs_sampler,
+#             )
+
+#             # Run sampler
+#             sampler.run_mcmc(**args_run_mcmc, **kwargs_run_mcmc)
+#         # Else run with multiprocessing
+#         else:
+#             with mp.Pool(n_proc) as pool:
+#                 # Initialize sampler
+#                 sampler = emcee.EnsembleSampler(
+#                     **args_sampler,
+#                     **kwargs_sampler,
+#                     pool=pool,
+#                 )
+
+#                 # Run sampler
+#                 sampler.run_mcmc(**args_run_mcmc, **kwargs_run_mcmc)
+
+#         return sampler
 
 
 class LambdaH0(Palmese21):

@@ -7,7 +7,7 @@ from myagn.distributions import ConstantPhysicalDensity
 from myagn.flares.models import ConstantRate
 from mygw.io.skymaps import GWTCCache, Skymap
 
-from mygwagn.inference.palmese21 import Lambda, mock_data
+from mygwagn.inference.palmese21 import Framework, Lambda, mock_data
 from mygwagn.io import paths
 
 ##############################
@@ -24,6 +24,7 @@ gwcache = GWTCCache(cache_dir=cache_dir)
 
 # Generate mock dataset
 lambda_ = 0.3
+cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 gw_skymaps, agn_flares, assoc_matrix = mock_data(
     pa.join(gwcache.cache_dir, "GWTC2.1"),
     lambda_=lambda_,
@@ -35,7 +36,7 @@ gw_skymaps, agn_flares, assoc_matrix = mock_data(
     background_skymap_level=5,
     background_z_grid=np.linspace(0, 1, 101),
     background_z_frac=0.9,
-    cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
+    cosmo=cosmo,
     rng=np.random.default_rng(12345),
     use_exact_rates=False,
     independent_gws=False,
@@ -50,13 +51,30 @@ print("assoc_matrix.shape:", assoc_matrix.shape)
 ##############################
 
 # Initialize agn distribution
-agn_distribution = ConstantPhysicalDensity(10**-4.75 * u.Mpc * -3)
+agn_distribution = ConstantPhysicalDensity(10**-4.75 * (u.Mpc**-3))
 
 # Initialize flare model
 flare_model = ConstantRate(1e-4 / 200 / u.day)
 
+# # Initialize inference
+# inference = Lambda(
+#     gw_skymaps=gw_skymaps,
+#     agn_flares=agn_flares,
+#     assoc_matrix=assoc_matrix,
+#     agn_distribution=agn_distribution,
+#     flare_model=flare_model,
+# )
+
+# # Run inference
+# sampler = inference.run_mcmc(
+#     lambda_0=0.5,
+#     n_steps=50,
+#     n_walkers=32,
+#     n_proc=32,
+# )
+
 # Initialize inference
-inference = Lambda(
+framework = Framework(
     gw_skymaps=gw_skymaps,
     agn_flares=agn_flares,
     assoc_matrix=assoc_matrix,
@@ -64,9 +82,18 @@ inference = Lambda(
     flare_model=flare_model,
 )
 
+# Initialize Lambda
+lambda_0 = 0.3
+inf_lambda = Lambda()
+
 # Run inference
-sampler = inference.run_mcmc(
-    lambda_0=0.5,
+sampler = inf_lambda.run_mcmc(
+    inference=framework,
+    lambda_0=lambda_0,
+    cosmo=cosmo,
+    n_steps=5000,
+    n_walkers=32,
+    n_proc=32,
 )
 
 # Save results
