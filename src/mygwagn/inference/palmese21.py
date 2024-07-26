@@ -88,10 +88,7 @@ def _calc_n_flares(
     n_flares = (
         active_volume * (10**-4.75 * u.Mpc**-3) * flare_model.flare_rate() * (t1 - t0)
     )
-    print("n_flares")
-    print(n_flares)
     n_flares = n_flares.to_value(u.dimensionless_unscaled)
-    print(n_flares)
 
     # Set/draw n_flares
     if use_exact_rates:
@@ -99,7 +96,6 @@ def _calc_n_flares(
         pass
     else:
         n_flares = rng.poisson(n_flares)
-    print(n_flares)
 
     return n_flares
 
@@ -125,20 +121,12 @@ def _sample_flare_coords(
 
     # Choose random ra, dec in hpxs
     dx, dy = rng.uniform(0, 1, (2, n_flares))
-    ra_flare_backgrounds, dec_flare_backgrounds = (
-        ah.healpix_to_lonlat(
-            hpx_flare_backgrounds,
-            ah.npix_to_nside(len(active_skymap)),
-            order="nested",
-            dx=dx,
-            dy=dy,
-        )
-        # hp.pix2ang(
-        #     ah.npix_to_nside(len(active_skymap)),
-        #     hpx_flare_backgrounds,
-        #     lonlat=True,
-        # )
-        # * u.deg
+    ra_flare_backgrounds, dec_flare_backgrounds = ah.healpix_to_lonlat(
+        hpx_flare_backgrounds,
+        ah.npix_to_nside(len(active_skymap)),
+        order="nested",
+        dx=dx,
+        dy=dy,
     )
 
     # Sample redshifts
@@ -228,7 +216,7 @@ def mock_data(
     ci_followup=0.9,
     Dt_followup=200 * u.day,
     background_skymap_level=5,
-    background_z_grid=np.linspace(0, 1, 101),
+    background_z_grid=np.linspace(0, 2, 201),
     background_z_frac=0.9,
     cosmo=FlatLambdaCDM(H0=70, Om0=0.3),
     rng=np.random.default_rng(12345),
@@ -270,7 +258,7 @@ def mock_data(
 
     # Select flare locations
     position_flare_gws = [
-        sm.draw_random_location(np.linspace(0, 1, 101)[:1], ci_followup)
+        sm.draw_random_location(np.linspace(0, 1, 101), ci_followup)
         for sm in skymap_flare_gws
     ]
 
@@ -314,13 +302,32 @@ def mock_data(
                 zmaxs.append(background_z_grid.max())
                 continue
 
+            # Set to background max/min for bad distmu
+            if not np.isfinite(sm_flat.skymap[i]["DISTMU"]):
+                zmins.append(background_z_grid.min())
+                zmaxs.append(background_z_grid.max())
+                continue
+
             # Get dp_dz
             dp_dz = sm_flat.dp_dz(background_z_grid, i)
 
             # Ensure probability sums to at least background_z_frac
-            if np.trapz(dp_dz, background_z_grid) < background_z_frac:
+            warn_message = None
+            prob_sum = np.trapz(dp_dz, background_z_grid)
+            if prob_sum < background_z_frac:
+                warn_message = (
+                    f"dp_dz sums to {prob_sum} < background_z_frac={background_z_frac}"
+                )
+            if prob_sum > 1.01:
+                warn_message = f"dp_dz sums to {prob_sum} > 101%"
+            if warn_message is not None:
                 print(
-                    "WARNING: dp_dz does not sum to at least background_z_frac; setting zmin and zmax to min and max of z_grid"
+                    "WARNING:",
+                    warn_message,
+                    f"(DISTMU={sm_flat.skymap[i]['DISTMU']},",
+                    f"DISTSIGMA={sm_flat.skymap[i]['DISTSIGMA']},",
+                    f"DISTNORM={sm_flat.skymap[i]['DISTNORM']});",
+                    "setting zmin and zmax to min and max of z_grid",
                 )
                 zmins.append(background_z_grid.min())
                 zmaxs.append(background_z_grid.max())
@@ -328,13 +335,6 @@ def mock_data(
                 # raise ValueError(
                 #     "dp_dz does not sum to at least background_z_frac; perhaps expand background_z_grid?"
                 # )
-            if np.trapz(dp_dz, background_z_grid) > 10:
-                print(
-                    "WARNING: dp_dz sums to > 1000%; setting zmin and zmax to min and max of z_grid"
-                )
-                zmins.append(background_z_grid.min())
-                zmaxs.append(background_z_grid.max())
-                continue
 
             # Get background_z_frac bounds
             argsort_dp_dz = np.argsort(dp_dz)[::-1]
@@ -369,14 +369,12 @@ def mock_data(
     agn_flares = []
     assoc_matrix = []
     for ti, ti_next in zip(ind_gw_time, np.roll(ind_gw_time, -1)):
-        print(f"Processing GW event #{ti}/{n_gw}")
 
         ##############################
         ###  Add activated skymap  ###
         ##############################
 
         # Mark as active
-        print(f"Setting GW event {ti} as active (Time {time_gws[ti]})")
         active_mask[ti] = True
 
         ##############################
@@ -388,14 +386,12 @@ def mock_data(
             time_next = Time("9999-12-31T23:59:59", format="isot", scale="utc")
         else:
             time_next = time_gws[ti_next]
-        print(f"Next GW event is at {time_next}")
 
         # Check active skymaps for termination (in time order)
         t0 = time_gws[ti]
         for tti in ind_gw_time:
             # Skip those that are not active
             if not active_mask[tti]:
-                print(f"GW event {tti} is not active; skipping")
                 continue
 
             # Set termination time
@@ -403,15 +399,11 @@ def mock_data(
 
             # Skip those that have already terminated
             if t1 < t0:
-                print(f"GW event {tti} has already terminated; skipping")
                 continue
 
             # Skip those that do not terminate before the next GW event
             if t1 >= time_next:
-                print(f"GW event {tti} does not terminate before next event; skipping")
                 continue
-
-            print(f"GW event {tti} terminates (Time {t1})")
 
             ##############################
             ###  Get number of flares  ###
@@ -471,7 +463,6 @@ def mock_data(
             t0 = t1
 
             # Mark terminated flare as inactive
-            print(f"Setting GW event {tti} as inactive (Time {time_gws[tti]})")
             active_mask[tti] = False
 
         ### Cover time block before next GW event begins
@@ -650,7 +641,7 @@ class Framework:
         cosmo = self.get_cosmo(cosmo)
 
         # Initialize b_arr
-        b_arr = np.zeros((len(self.gw_skymaps), len(self.agn_flares)))
+        b_arr = np.ones((len(self.gw_skymaps), len(self.agn_flares)))
 
         # Fetch flares, flare redshifts
         flares = [self.agn_flares[i] for i in self.ind_flare]
