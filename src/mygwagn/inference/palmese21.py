@@ -892,9 +892,9 @@ class Lambda:
 #         return sampler
 
 
-class LambdaH0(Palmese21):
+class LambdaH0:
     pass
 
 
-class LambdaH0Om0(Palmese21):
+class LambdaH0Om0:
     pass
