@@ -92,7 +92,7 @@ def _calc_n_flares(
 
     # Set/draw n_flares
     if use_exact_rates:
-        n_flares = round(n_flares.to_value(u.dimensionless_unscaled))
+        n_flares = round(n_flares)
         pass
     else:
         n_flares = rng.poisson(n_flares)
@@ -109,7 +109,8 @@ def _sample_flare_coords(
     rng,
 ):
     # Sample flare times
-    time_flare_backgrounds = rng.uniform(t0.mjd, t1.mjd, n_flares) * u.day
+    time_flare_backgrounds = rng.uniform(t0.mjd, t1.mjd, n_flares)
+    time_flare_backgrounds = [Time(t, format="mjd") for t in time_flare_backgrounds]
 
     # Sample hpx
     hpx_flare_backgrounds = rng.choice(
@@ -147,14 +148,15 @@ def _sample_flare_coords(
         z_flare_backgrounds.append(z)
 
     # Compile flare coordinates
-    coord_flares = np.array(
-        [
+    coord_flares = [
+        [t, ra, dec, z]
+        for t, ra, dec, z in zip(
             time_flare_backgrounds,
-            ra_flare_backgrounds.to(u.deg).value,
-            dec_flare_backgrounds.to(u.deg).value,
+            ra_flare_backgrounds,
+            dec_flare_backgrounds,
             z_flare_backgrounds,
-        ]
-    ).T
+        )
+    ]
 
     return coord_flares
 
@@ -176,10 +178,7 @@ def _update_flares(
     # Add gw flares in time interval
     for cfgw in coord_flare_gws:
         if t0 <= cfgw[0] < t1:
-            cfgw_temp = copy(cfgw)
-            cfgw_temp[1] = cfgw_temp[1].to(u.deg).value
-            cfgw_temp[2] = cfgw_temp[2].to(u.deg).value
-            coord_flares = np.vstack([coord_flares, cfgw_temp])
+            coord_flares.append(cfgw)
 
     # Iterate over flares
     for cf in coord_flares:
@@ -188,8 +187,8 @@ def _update_flares(
 
         # Get flare hpx
         hpx = ah.lonlat_to_healpix(
-            cf[1] * u.deg,
-            cf[2] * u.deg,
+            cf[1],
+            cf[2],
             nside=ah.npix_to_nside(len(gw_skymaps_flat[0].skymap)),
             order="nested",
         )
@@ -197,7 +196,12 @@ def _update_flares(
         # Iterate over active GWs
         for tia in np.arange(len(gw_skymaps_flat)):
             if active_mask[tia]:
-                if gw_skymaps_flat[tia].skymap["INCIFOLLOWUP"][hpx]:
+                # If in follow-up volume
+                if gw_skymaps_flat[tia].skymap[hpx]["INCIFOLLOWUP"] and (
+                    gw_skymaps_flat[tia].skymap[hpx]["ZMIN"]
+                    <= cf[3]
+                    <= gw_skymaps_flat[tia].skymap[hpx]["ZMAX"]
+                ):
                     assoc_row[tia] = True
 
         # Append to agn_flares, assoc_matrix
@@ -222,11 +226,20 @@ def mock_data(
     rng=np.random.default_rng(12345),
     use_exact_rates=False,
     independent_gws=False,
+    verbose=1,
 ):
     """Generates a mock observation dataset for this analysis."""
-    ##############################
-    ###        GW events       ###
-    ##############################
+
+    ##################################################
+    ##################################################
+    ####                                          ####
+    ####                GW events                 ####
+    ####                                          ####
+    ##################################################
+    ##################################################
+
+    print("*" * 60)
+    print("Selecting GW events for mock follow-up...")
 
     # Get skymap filenames
     skymap_filenames = glob.glob(pa.join(skymap_dir, "*IMRPhenomXPHM.fits"))
@@ -237,11 +250,27 @@ def mock_data(
     # Initialize skymaps
     gw_skymaps = [Skymap(f, moc=True) for f in skymap_filenames]
 
-    ##############################
-    ###        AGN flares      ###
-    ##############################
+    print(f"Selected {len(gw_skymaps)} events")
 
-    ### GW counterpart flares
+    ##################################################
+    ##################################################
+    ####                                          ####
+    ####                AGN flares                ####
+    ####                                          ####
+    ##################################################
+    ##################################################
+
+    print("*" * 60)
+    print("Generating AGN flares...")
+
+    ########################################
+    ########################################
+    ####     GW counterpart flares      ####
+    ########################################
+    ########################################
+
+    print("*" * 50)
+    print("Generating GW counterpart flares...")
 
     # Draw n_flares_gw from Poisson distribution
     n_flares_gw_expected = lambda_ * n_gw
@@ -249,7 +278,7 @@ def mock_data(
         n_flares_gw = round(n_flares_gw_expected)
     else:
         n_flares_gw = rng.poisson(n_flares_gw_expected)
-        n_flares_gw = max(n_flares_gw, n_gw)
+        n_flares_gw = min(n_flares_gw, n_gw)
 
     # Select gw events for flares
     i_gws = np.arange(n_gw)
@@ -277,10 +306,31 @@ def mock_data(
     # Combine coordinates
     coord_flare_gws = [[t, *x] for t, x in zip(times_flare_gws, position_flare_gws)]
 
-    ### Background flares
+    # Summarize step
+    print(f"Generated {n_flares_gw} GW counterpart flares")
+    print(f"(lambda={lambda_} * n_gw={n_gw} ~ {lambda_ * n_gw})")
+    if verbose > 0:
+        for sfg, cfg in zip(skymap_flare_gws, coord_flare_gws):
+            print(
+                pa.basename(sfg.filename).split("-v2-")[1].split("_PED")[0],
+                cfg[0].iso,
+                cfg[1].to(u.hourangle),
+                cfg[2].to(u.deg),
+                f"{cfg[3]:.2f}",
+            )
+
+    ########################################
+    ########################################
+    ####        Background flares       ####
+    ########################################
+    ########################################
+
+    print("*" * 50)
+    print("Generating background flares...")
 
     ## Rasterize GW skymaps for easier volume calculations
     gw_skymaps_flat = []
+    coord_flare_backgrounds = []
     for sm in gw_skymaps:
         # Flatten skymap
         sm_flat = sm.flatten(background_skymap_level)
@@ -425,12 +475,14 @@ def mock_data(
             )
 
             # Draw coords if n_flares > 0
+            coord_flares = []
             if n_flares > 0:
 
                 ##############################
                 ###Sample flare coordinates###
                 ##############################
 
+                # Sample coordinates for flares
                 coord_flares = _sample_flare_coords(
                     n_flares,
                     t0,
@@ -440,20 +492,23 @@ def mock_data(
                     rng,
                 )
 
-                ##############################
-                ###  Update assoc_matrix   ###
-                ##############################
+                # Update running list
+                coord_flare_backgrounds = [*coord_flare_backgrounds, *coord_flares]
 
-                agn_flares, assoc_matrix = _update_flares(
-                    t0,
-                    t1,
-                    coord_flares,
-                    coord_flare_gws,
-                    gw_skymaps_flat,
-                    active_mask,
-                    agn_flares,
-                    assoc_matrix,
-                )
+            ##############################
+            ###  Update assoc_matrix   ###
+            ##############################
+
+            agn_flares, assoc_matrix = _update_flares(
+                t0,
+                t1,
+                coord_flares,
+                coord_flare_gws,
+                gw_skymaps_flat,
+                active_mask,
+                agn_flares,
+                assoc_matrix,
+            )
 
             ##############################
             ###      Cleanup loop      ###
@@ -491,12 +546,14 @@ def mock_data(
             )
 
             # Draw coords if n_flares > 0
+            coord_flares = []
             if n_flares > 0:
 
                 ##############################
                 ###Sample flare coordinates###
                 ##############################
 
+                # Sample coordinates for flares
                 coord_flares = _sample_flare_coords(
                     n_flares,
                     t0,
@@ -506,27 +563,54 @@ def mock_data(
                     rng,
                 )
 
-                ##############################
-                ###  Update assoc_matrix   ###
-                ##############################
+                # Update running list
+                coord_flare_backgrounds = [*coord_flare_backgrounds, *coord_flares]
 
-                agn_flares, assoc_matrix = _update_flares(
-                    t0,
-                    t1,
-                    coord_flares,
-                    coord_flare_gws,
-                    gw_skymaps_flat,
-                    active_mask,
-                    agn_flares,
-                    assoc_matrix,
-                )
+            ##############################
+            ###  Update assoc_matrix   ###
+            ##############################
 
-    ##############################
-    ###        Return          ###
-    ##############################
+            agn_flares, assoc_matrix = _update_flares(
+                t0,
+                t1,
+                coord_flares,
+                coord_flare_gws,
+                gw_skymaps_flat,
+                active_mask,
+                agn_flares,
+                assoc_matrix,
+            )
+
+    # Report background flares
+    print(f"Generated {len(coord_flare_backgrounds)} background flares")
+    if verbose > 0:
+        for cfb in coord_flare_backgrounds:
+            print(
+                cfb[0].iso,
+                cfb[1].to(u.hourangle),
+                cfb[2].to(u.deg),
+                f"{cfb[3]:.2f}",
+            )
+
+    ##################################################
+    ##################################################
+    ####                                          ####
+    ####                  Return                  ####
+    ####                                          ####
+    ##################################################
+    ##################################################
 
     # Transpose assoc_matrix to comply with n_gw x n_flares convention
     assoc_matrix = np.transpose(assoc_matrix)
+
+    # Print summary
+    if verbose > 0:
+        print("*" * 50)
+        print("Summary:")
+        print(f"n_gw: {n_gw}")
+        print(f"n_flares_gw: {n_flares_gw}")
+        print(f"n_flares_background: {len(coord_flare_backgrounds)}")
+        print(f"n_flares_total: {len(agn_flares)}")
 
     return gw_skymaps, agn_flares, assoc_matrix
 
@@ -689,10 +773,21 @@ class Lambda:
             return 0.0
         return -np.inf
 
-    def ln_likelihood(self, lambda_):
+    def ln_likelihood_palmese21(self, lambda_):
         # Calculate likelihood
         ln_likelihood = (
             np.sum(np.log(lambda_ * self.s_arr + self.b_arr))
+            # - self.calc_mu_arr(lambda_).sum()
+            - lambda_ * self.s_arr.shape[0]
+        )
+
+        return ln_likelihood
+
+    def ln_likelihood_modified(self, lambda_):
+        # Calculate likelihood
+        ln_likelihood = (
+            np.log(lambda_ * (np.sum(self.s_arr / self.b_arr) + 1))
+            + np.sum(np.log(self.b_arr))
             # - self.calc_mu_arr(lambda_).sum()
             - lambda_ * self.s_arr.shape[0]
         )
@@ -708,7 +803,7 @@ class Lambda:
             return -np.inf
 
         # Evaluate likelihood, after updating mu_arr
-        ln_likelihood = self.ln_likelihood(lambda_)
+        ln_likelihood = self._ln_likelihood(lambda_)
 
         # Combine into posterior
         ln_posterior = ln_prior + ln_likelihood
@@ -719,6 +814,7 @@ class Lambda:
         self,
         inference=None,
         lambda_0=0.5,
+        likelihood="palmese21",
         cosmo=None,
         n_walkers=32,
         n_steps=5000,
@@ -729,6 +825,9 @@ class Lambda:
 
         # Set arrays
         self.set_arrs(inference, lambda_0, cosmo)
+
+        # Set likelihood function
+        self._ln_likelihood = getattr(self, f"ln_likelihood_{likelihood}")
 
         # Initial lambdas; clip to 0, 1
         initial_state = lambda_0 + 1e-4 * np.random.randn(n_walkers, 1)

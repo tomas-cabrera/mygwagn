@@ -18,6 +18,12 @@ from mygwagn.io import paths
 cache_dir = pa.join(paths.cache_dir, "tmp")
 gwcache = GWTCCache(cache_dir=cache_dir)
 
+# Initialize agn distribution
+agn_distribution = ConstantPhysicalDensity(10**-4.75 * (u.Mpc**-3))
+
+# Initialize flare model
+flare_model = ConstantRate(1e-6 / 200 / u.day)
+
 ##############################
 ###       Mock data        ###
 ##############################
@@ -28,8 +34,8 @@ cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
 gw_skymaps, agn_flares, assoc_matrix = mock_data(
     pa.join(gwcache.cache_dir, "GWTC2.1"),
     lambda_=lambda_,
-    agn_distribution=ConstantPhysicalDensity(10**-4.75 * u.Mpc**-3),
-    flare_model=ConstantRate(1e-4 / 200 / u.day),
+    agn_distribution=agn_distribution,
+    flare_model=flare_model,
     n_gw=50,
     ci_followup=0.9,
     Dt_followup=200 * u.day,
@@ -42,19 +48,9 @@ gw_skymaps, agn_flares, assoc_matrix = mock_data(
     independent_gws=False,
 )
 
-print("# gw_skymaps:", len(gw_skymaps))
-print("# agn_flares:", len(agn_flares))
-print("assoc_matrix.shape:", assoc_matrix.shape)
-
 ##############################
 ###       Inference        ###
 ##############################
-
-# Initialize agn distribution
-agn_distribution = ConstantPhysicalDensity(10**-4.75 * (u.Mpc**-3))
-
-# Initialize flare model
-flare_model = ConstantRate(1e-4 / 200 / u.day)
 
 # Initialize inference
 framework = Framework(
@@ -80,7 +76,11 @@ sampler = inf_lambda.run_mcmc(
 )
 
 # Save results
-flat_samples = sampler.get_chain(discard=100, thin=15, flat=True)
+flat_samples = sampler.get_chain(
+    discard=100,
+    thin=15,
+    flat=True,
+)
 np.savetxt("flat_samples.npy", flat_samples)
 
 ##############################
