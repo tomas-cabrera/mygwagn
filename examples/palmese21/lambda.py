@@ -31,7 +31,7 @@ flare_model = ConstantRate(1e-6 / 200 / u.day)
 # Generate mock dataset
 lambda_ = 0.3
 cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
-gw_skymaps, agn_flares, assoc_matrix = mock_data(
+gw_skymaps, agn_flares, assoc_matrix, _ = mock_data(
     pa.join(gwcache.cache_dir, "GWTC2.1"),
     lambda_=lambda_,
     agn_distribution=agn_distribution,

@@ -604,15 +604,17 @@ def mock_data(
     assoc_matrix = np.transpose(assoc_matrix)
 
     # Print summary
+    lambda_actual = n_flares_gw / n_gw
     if verbose > 0:
         print("*" * 50)
         print("Summary:")
+        print(f"lambda={lambda_}, lambda_actual={lambda_actual}")
         print(f"n_gw: {n_gw}")
         print(f"n_flares_gw: {n_flares_gw}")
         print(f"n_flares_background: {len(coord_flare_backgrounds)}")
         print(f"n_flares_total: {len(agn_flares)}")
 
-    return gw_skymaps, agn_flares, assoc_matrix
+    return gw_skymaps, agn_flares, assoc_matrix, lambda_actual
 
 
 class Framework:
@@ -697,11 +699,16 @@ class Framework:
             ]
         )
 
-        # Combine probability densities
-        s_values = dp_dOmega * dp_dz
+        # Calculate number density of gw event
+        # Because each probability distribution corresponds to 1 event, dn_dOmega_dz = dp_dOmega_dz
+        dn_dOmega_dz = dp_dOmega * dp_dz
+
+        # Save as s_values
+        # (not rate of flares like for b_arr, since lambda_ is multiplied later)
+        s_values = dn_dOmega_dz.flatten()
 
         # Set values in s_arr
-        s_arr[self.assoc_matrix] = s_values.flatten()
+        s_arr[self.assoc_matrix] = s_values
 
         return s_arr  # Shape: (n_skymaps, n_flares)
 
@@ -731,17 +738,17 @@ class Framework:
         flares = [self.agn_flares[i] for i in self.ind_flare]
         z_flares = [f.z for f in flares]
 
-        # Calculate values
-        b_values = (
-            self.agn_distribution.dp_dOmega_dz(
-                z_grid=self.z_grid,
-                z_evaluate=z_flares,
-                cosmo=cosmo,
-                brightness_limits=brightness_limits,
-            )
-            * self.Dt_followup
-            * self.flare_model.flare_rate(flares)
+        # Calculate number density of AGNi
+        dn_dOmega_dz = self.agn_distribution.dn_dOmega_dz(
+            zs=z_flares,
+            cosmo=cosmo,
+            brightness_limits=brightness_limits,
         )
+
+        # Calculate number density of flares
+        b_values = (
+            dn_dOmega_dz * self.Dt_followup * self.flare_model.flare_rate(flares)
+        ).flatten()
 
         # Set values in b_arr
         b_arr[self.assoc_matrix] = b_values
@@ -819,18 +826,21 @@ class Lambda:
         n_walkers=32,
         n_steps=5000,
         n_proc=32,
+        rng=np.random.default_rng(12345),
     ):
         # # Get cosmo
         # cosmo = self.get_cosmo(cosmo)
 
         # Set arrays
         self.set_arrs(inference, lambda_0, cosmo)
+        print("s_arr: ", self.s_arr)
+        print("b_arr: ", self.b_arr)
 
         # Set likelihood function
         self._ln_likelihood = getattr(self, f"ln_likelihood_{likelihood}")
 
         # Initial lambdas; clip to 0, 1
-        initial_state = lambda_0 + 1e-4 * np.random.randn(n_walkers, 1)
+        initial_state = lambda_0 + 1e-4 * rng.standard_normal((n_walkers, 1))
         initial_state = np.clip(initial_state, 0.0, 1.0)
 
         # Define sampler args
