@@ -9,7 +9,7 @@ The specifiable parameters are the flares-per-GW event $\lambda$, the background
 
 ### Input data
 
-GWs are presently drawn from GWTC2.1, and are generally handled with teh `Skymap` class in https://github.com/tomas-cabrera/mygw/blob/main/src/mygw/io/skymaps.py.
+GWs are presently drawn from GWTC2.1, and are generally handled with the `Skymap` class in https://github.com/tomas-cabrera/mygw/blob/main/src/mygw/io/skymaps.py.
 
 The background AGN distribution is handled with a child of the `AGNDistribution` class in https://github.com/tomas-cabrera/myagn/blob/main/src/myagn/distributions.py; the default distribution assumes a constant physical density (Mpc$^{-3}$).
 
@@ -47,7 +47,7 @@ Times are chosen from a uniform distribution over the follow-up interval.
 #### Wrap-up
 
 The resulting GW events and AGN flares are cast into suitable objects.
-Finally, the flares are cross-matched with the GW events to determine which flares fall into which follow-up campaigns (volume + time constrained); this information is recorded in `assoc_matrix`, a $n_{\rm gw} \times n_{\rm flare}$ Boolean matrix that is True where the flare falls in the GW volume.
+Finally, the flares are cross-matched with the GW events to determine which flares fall into which follow-up campaigns (volume + time constrained); this information is recorded in `assoc_matrix`, an $n_{\rm gw} \times n_{\rm flare}$ Boolean matrix that is True where the flare falls in the GW volume.
 
 ### Calculating s_arr and b_arr
 
