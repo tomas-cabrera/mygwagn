@@ -43,6 +43,7 @@ def _calc_active_skymap(active_skymaps):
     zmax_arr[~hpx_arr] = np.nan
 
     # Get min, max zmins, zmaxs
+    # BUG: if there is a near and far GW event, then the follow-up volume will include the space between them as well
     zmin = np.nanmin(zmin_arr, axis=0)
     zmax = np.nanmax(zmax_arr, axis=0)
 
@@ -54,6 +55,47 @@ def _calc_active_skymap(active_skymaps):
 
     # Compile results
     active_skymap = QTable([hpxs, zmin, zmax], names=["INCIFOLLOWUP", "ZMIN", "ZMAX"])
+
+    # ### DEBUG: check volumes
+    # cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
+    # outstr = "\n"
+    # ## volumes for active skymaps
+    # for asm in active_skymaps:
+    #     # ligo.skymap crossmatch volume:
+    #     asm["UNIQ"] = ah.level_ipix_to_uniq(
+    #         ah.nside_to_level(ah.npix_to_nside(len(asm))),
+    #         np.arange(len(asm)),
+    #     )
+    #     cmresult = crossmatch(asm, contours=[0.9]).contour_vols[0] * u.Mpc**3
+    #     outstr += f"\nligo.skymap volume={cmresult:.2f}, "
+
+    #     # Calculate prism volumes for each hpx by dividing comoving volume difference by number of pixels
+    #     # prism volume = (4/3 pi d_comoving(zmax)^3 - 4/3 pi d_comoving(zmax)^3) / n_pix
+    #     active_volume_prisms = (
+    #         cosmo.comoving_volume(
+    #             asm["ZMAX"],
+    #         )
+    #         - cosmo.comoving_volume(
+    #             asm["ZMIN"],
+    #         )
+    #     ) / len(asm)
+    #     # Sum to get total active volume
+    #     active_volume = active_volume_prisms[asm["INCIFOLLOWUP"]].sum()
+    #     outstr += f"prism volume={active_volume.to(u.Mpc**3):.2f}"
+    # ## active_skymap volume
+    # active_volume_prisms = (
+    #     cosmo.comoving_volume(
+    #         active_skymap["ZMAX"],
+    #     )
+    #     - cosmo.comoving_volume(
+    #         active_skymap["ZMIN"],
+    #     )
+    # ) / len(active_skymap)
+    # # Sum to get total active volume
+    # active_volume = active_volume_prisms[active_skymap["INCIFOLLOWUP"]].sum()
+    # outstr += f"\ntotal prism volume={active_volume.to(u.Mpc**3):.2f}"
+    # outstr += "\n"
+    # print(outstr)
 
     # Return
     return active_skymap
@@ -228,7 +270,9 @@ def mock_data(
     independent_gws=False,
     verbose=1,
 ):
-    """Generates a mock observation dataset for this analysis."""
+    """Generates a mock observation dataset for this analysis.
+    This version includes the first attempt to calculate a total follow-up volume for all active skymaps, accounting for overlaps.
+    """
 
     ##################################################
     ##################################################
@@ -330,7 +374,6 @@ def mock_data(
 
     ## Rasterize GW skymaps for easier volume calculations
     gw_skymaps_flat = []
-    coord_flare_backgrounds = []
     for sm in gw_skymaps:
         # Flatten skymap
         sm_flat = sm.flatten(background_skymap_level)
@@ -368,9 +411,6 @@ def mock_data(
                 warn_message = (
                     f"dp_dz sums to {prob_sum} < background_z_frac={background_z_frac}"
                 )
-            if prob_sum > 1.01:
-                warn_message = f"dp_dz sums to {prob_sum} > 101%"
-            if warn_message is not None:
                 print(
                     "WARNING:",
                     warn_message,
@@ -382,6 +422,26 @@ def mock_data(
                 zmins.append(background_z_grid.min())
                 zmaxs.append(background_z_grid.max())
                 continue
+            if prob_sum > 1.01:
+                warn_message = f"dp_dz sums to {prob_sum} > 101%"
+                print(
+                    "WARNING:",
+                    warn_message,
+                    f"(DISTMU={sm_flat.skymap[i]['DISTMU']},",
+                    f"DISTSIGMA={sm_flat.skymap[i]['DISTSIGMA']},",
+                    f"DISTNORM={sm_flat.skymap[i]['DISTNORM']});",
+                    "substituting values for maximum probability hpx",
+                )
+                if sm_flat.moc:
+                    probkey = "PROBDENSITY"
+                else:
+                    probkey = "PROB"
+                dp_dz = sm_flat.dp_dz(
+                    background_z_grid,
+                    np.argmax(sm_flat.skymap[probkey]),
+                )
+            if warn_message is not None:
+                pass
                 # raise ValueError(
                 #     "dp_dz does not sum to at least background_z_frac; perhaps expand background_z_grid?"
                 # )
@@ -418,6 +478,7 @@ def mock_data(
     active_mask = [False] * n_gw
     agn_flares = []
     assoc_matrix = []
+    coord_flare_backgrounds = []
     for ti, ti_next in zip(ind_gw_time, np.roll(ind_gw_time, -1)):
 
         ##############################
@@ -731,12 +792,11 @@ class Framework:
         # Set cosmo
         cosmo = self.get_cosmo(cosmo)
 
-        # Initialize b_arr
-        b_arr = np.ones((len(self.gw_skymaps), len(self.agn_flares)))
+        # # Initialize b_arr
+        # b_arr = np.ones((len(self.gw_skymaps), len(self.agn_flares)))
 
         # Fetch flares, flare redshifts
-        flares = [self.agn_flares[i] for i in self.ind_flare]
-        z_flares = [f.z for f in flares]
+        z_flares = [f.z for f in self.agn_flares]
 
         # Calculate number density of AGNi
         dn_dOmega_dz = self.agn_distribution.dn_dOmega_dz(
@@ -747,11 +807,14 @@ class Framework:
 
         # Calculate number density of flares
         b_values = (
-            dn_dOmega_dz * self.Dt_followup * self.flare_model.flare_rate(flares)
+            dn_dOmega_dz
+            * self.Dt_followup
+            * self.flare_model.flare_rate(self.agn_flares)
         ).flatten()
 
         # Set values in b_arr
-        b_arr[self.assoc_matrix] = b_values
+        b_arr = np.repeat([b_values], len(self.gw_skymaps), axis=0)
+        # b_arr[self.assoc_matrix] = b_values
 
         return b_arr  # Shape: (n_skymaps, n_flares)
 
@@ -774,6 +837,9 @@ class Lambda:
         # Calculate mu terms
         self.mu_arr = inference.calc_mu_arr(lambda_, cosmo=cosmo)
 
+        # Set association matrix
+        self.assoc_matrix = inference.assoc_matrix
+
     def ln_prior(self, lambda_):
         # If in ok domain, return 0; otheriwse return -inf
         if 0.0 <= lambda_ <= 1.0:
@@ -783,18 +849,56 @@ class Lambda:
     def ln_likelihood_palmese21(self, lambda_):
         # Calculate likelihood
         ln_likelihood = (
-            np.sum(np.log(lambda_ * self.s_arr + self.b_arr))
+            np.sum(np.log((lambda_ * self.s_arr + self.b_arr)[self.assoc_matrix]))
             # - self.calc_mu_arr(lambda_).sum()
             - lambda_ * self.s_arr.shape[0]
         )
 
         return ln_likelihood
 
-    def ln_likelihood_modified(self, lambda_):
+    def ln_likelihood_onegwflare(self, lambda_):
         # Calculate likelihood
+        # Lowball version; assumes 0-1 gw flares per dataset, rest are background
+        # (i.e. assumes at most one flare across all follow-ups is gw-sourced)
         ln_likelihood = (
-            np.log(lambda_ * (np.sum(self.s_arr / self.b_arr) + 1))
-            + np.sum(np.log(self.b_arr))
+            np.log(lambda_ * np.sum((self.s_arr / self.b_arr)[self.assoc_matrix]) + 1)
+            + np.sum(np.log(self.b_arr[self.assoc_matrix]))
+            # - self.calc_mu_arr(lambda_).sum()
+            - lambda_ * self.s_arr.shape[0]
+        )
+
+        return ln_likelihood
+
+    def ln_likelihood_multiflare(self, lambda_):
+        # Calculate likelihood
+        # multiflare version: still contains terms associating multiple flares to a single GW event
+        ln_likelihood = (
+            np.sum(
+                np.log(
+                    lambda_
+                    * np.sum((self.s_arr / self.b_arr) * self.assoc_matrix, axis=1)
+                    + 1
+                )
+            )
+            + np.sum(np.log(self.b_arr[self.assoc_matrix]))
+            # - self.calc_mu_arr(lambda_).sum()
+            - lambda_ * self.s_arr.shape[0]
+        )
+
+        return ln_likelihood
+
+    def ln_likelihood_multigw(self, lambda_):
+        # Calculate likelihood
+        # multigw version: still contains terms where a single flare is associated with multiple GW events
+        ln_likelihood = (
+            np.sum(
+                np.log(
+                    lambda_
+                    * np.sum((self.s_arr / self.b_arr) * self.assoc_matrix, axis=0)
+                    + 1
+                )
+            )
+            + np.sum(np.log(self.b_arr[self.assoc_matrix]))
             # - self.calc_mu_arr(lambda_).sum()
             - lambda_ * self.s_arr.shape[0]
         )
@@ -833,8 +937,12 @@ class Lambda:
 
         # Set arrays
         self.set_arrs(inference, lambda_0, cosmo)
-        print("s_arr: ", self.s_arr)
-        print("b_arr: ", self.b_arr)
+        print("s_arr:")
+        print(self.s_arr)
+        print("b_arr:")
+        print(self.b_arr)
+        print("np.sum(assoc_matrix, axis=0):", np.sum(self.assoc_matrix, axis=0))
+        print("np.sum(assoc_matrix, axis=1):", np.sum(self.assoc_matrix, axis=1))
 
         # Set likelihood function
         self._ln_likelihood = getattr(self, f"ln_likelihood_{likelihood}")
